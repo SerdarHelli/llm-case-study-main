@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  # FastAPI application
+  api:
+    build: .
+    container_name: veridia-rag-api
+    ports:
+      - "8000:8000"
+    environment:
+      - MILVUS_HOST=milvus
+      - MILVUS_PORT=19530
+      - LLM_BASE_URL=http://ollama:11434
+      - LLM_MODEL=llama2:7b
+    depends_on:
+      - milvus
+      - ollama
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    networks:
+      - veridia-network
+
+  # Milvus vector database
+  milvus:
+    image: milvusdb/milvus:v0.3.10
+    container_name: veridia-milvus
+    environment:
+      ETCD_USE_EMBED: 'true'
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    volumes:
+      - milvus_data:/var/lib/milvus
+    networks:
+      - veridia-network
+
+  # Ollama LLM service
+  ollama:
+    image: ollama/ollama:latest
+    container_name: veridia-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - veridia-network
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+
+volumes:
+  milvus_data:
+  ollama_data:
+
+networks:
+  veridia-network:
+    driver: bridge
