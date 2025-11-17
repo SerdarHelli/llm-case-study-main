@@ -33,10 +33,16 @@ To get a token:
 2. Create a new token with read permissions
 3. Accept the Llama-2-7b-hf license at https://huggingface.co/meta-llama/Llama-2-7b-hf
 
-### 2. Start Services
+### 2. Build Docker Images
 
 ```bash
 cd /root/llm-case-study-main
+DOCKER_BUILDKIT=0 docker build -t llm-case-study-main_api .
+```
+
+### 3. Start Services
+
+```bash
 docker-compose up -d
 ```
 
@@ -44,7 +50,7 @@ This starts:
 - **vLLM API** (port 8001): LLM inference server
 - **Veridia API** (port 8000): RAG backend
 
-### 3. Wait for Initialization
+### 4. Wait for Initialization
 
 The vLLM container will take 5-15 minutes to download and load the model. Monitor progress:
 
@@ -91,7 +97,8 @@ Response format:
 ### Run Evaluation Tests
 
 ```bash
-docker-compose --profile eval up eval
+python scripts/prepare_data.py
+python scripts/eval.py
 ```
 
 This runs:
@@ -104,11 +111,7 @@ Evaluation data located in:
 - `data/questions.txt` - Test questions
 - `data/answers.txt` - Expected answers
 
-### Manual Evaluation
 
-```bash
-docker exec veridia-rag-api python scripts/eval.py
-```
 
 ## Project Structure
 
