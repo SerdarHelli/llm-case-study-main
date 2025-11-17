@@ -4,58 +4,41 @@ import os
 import sys
 import json
 import logging
-from typing import List, Dict, Tuple
+from typing import List, Dict
 from sentence_transformers import SentenceTransformer
-from pymilvus import connections, Collection
+from pymilvus import MilvusClient
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-EMBEDDING_MODEL = "Snowflake/snowflake-arctic-embed-s"
-MILVUS_HOST = "127.0.0.1"
-MILVUS_PORT = 19530
-COLLECTION_NAME = "pdf_chunks"
-TOP_K = 5
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "Snowflake/snowflake-arctic-embed-s")
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "pdf_chunks")
+DB_FILE = os.getenv("DB_FILE", "milvus_lite.db")
+TOP_K = int(os.getenv("TOP_K", "5"))
 
 class RAGEvaluator:
     def __init__(self):
         self.embedding_model = SentenceTransformer(EMBEDDING_MODEL)
-        self._connect_milvus()
-    
-    def _connect_milvus(self):
-        """Connect to Milvus."""
-        try:
-            connections.connect("default", host=MILVUS_HOST, port=MILVUS_PORT)
-            self.collection = Collection(COLLECTION_NAME)
-            self.collection.load()
-            logger.info(f"Connected to Milvus collection: {COLLECTION_NAME}")
-        except Exception as e:
-            logger.error(f"Error connecting to Milvus: {e}")
-            raise
+        self.client = MilvusClient(DB_FILE)
+        logger.info(f"Initialized MilvusClient with db file: {DB_FILE}")
     
     def retrieve_context(self, question: str, top_k: int = TOP_K) -> List[str]:
-        """Retrieve relevant chunks from Milvus."""
+        """Retrieve relevant chunks from Milvus Lite."""
         question_embedding = self.embedding_model.encode([question])[0]
         
-        search_params = {
-            "metric_type": "L2",
-            "params": {"nprobe": 16}
-        }
-        
-        results = self.collection.search(
+        results = self.client.search(
+            collection_name=COLLECTION_NAME,
             data=[question_embedding.tolist()],
-            anns_field="embedding",
-            param=search_params,
             limit=top_k,
             output_fields=["text"]
         )
         
         chunks = []
-        for hits in results:
-            for hit in hits:
-                chunks.append(hit.entity.get("text"))
+        if results and len(results) > 0:
+            for hit in results[0]:
+                chunks.append(hit["entity"]["text"])
         
         return chunks
     
@@ -99,22 +82,18 @@ class RAGEvaluator:
             "overall_score": 0.0
         }
         
-        # Exact match (case-insensitive, trimmed)
         if generated_answer.lower().strip() == expected_answer.lower().strip():
             metrics["exact_match"] = 1.0
         
-        # Semantic similarity
-        metrics["semantic_similarity"] = self.calculate_semantic_similarity(
+        metrics["semantic_similarity"] = float(self.calculate_semantic_similarity(
             generated_answer, expected_answer
-        )
+        ))
         
-        # Entity overlap
-        metrics["entity_overlap"] = self.calculate_entity_overlap(
+        metrics["entity_overlap"] = float(self.calculate_entity_overlap(
             generated_answer, expected_answer
-        )
+        ))
         
-        # Overall score (weighted average)
-        metrics["overall_score"] = (
+        metrics["overall_score"] = float(
             0.3 * metrics["exact_match"] +
             0.5 * metrics["semantic_similarity"] +
             0.2 * metrics["entity_overlap"]
@@ -161,7 +140,6 @@ class RAGEvaluator:
             logger.info(f"Evaluating question {i+1}/{len(questions)}: {question[:50]}...")
             
             try:
-                # Retrieve context
                 context_chunks = self.retrieve_context(question)
                 
                 if not context_chunks:
@@ -169,30 +147,27 @@ class RAGEvaluator:
                     generated_answer = "No relevant information found."
                 else:
                     retrieval_successes += 1
-                    # For evaluation, create a simple answer from context
                     generated_answer = self._generate_simple_answer(question, context_chunks)
                 
                 expected_answer = answers[i] if i < len(answers) else "Unknown"
                 
-                # Evaluate
                 eval_result = self.evaluate_answer(question, generated_answer, expected_answer)
                 results["evaluations"].append(eval_result)
             
             except Exception as e:
                 logger.error(f"Error evaluating question {i+1}: {e}")
         
-        # Calculate summary statistics
         if results["evaluations"]:
             exact_matches = [e["exact_match"] for e in results["evaluations"]]
             semantic_sims = [e["semantic_similarity"] for e in results["evaluations"]]
             entity_overlaps = [e["entity_overlap"] for e in results["evaluations"]]
             overall_scores = [e["overall_score"] for e in results["evaluations"]]
             
-            results["summary"]["avg_exact_match"] = np.mean(exact_matches)
-            results["summary"]["avg_semantic_similarity"] = np.mean(semantic_sims)
-            results["summary"]["avg_entity_overlap"] = np.mean(entity_overlaps)
-            results["summary"]["avg_overall_score"] = np.mean(overall_scores)
-            results["summary"]["retrieval_success_rate"] = retrieval_successes / len(questions)
+            results["summary"]["avg_exact_match"] = float(np.mean(exact_matches))
+            results["summary"]["avg_semantic_similarity"] = float(np.mean(semantic_sims))
+            results["summary"]["avg_entity_overlap"] = float(np.mean(entity_overlaps))
+            results["summary"]["avg_overall_score"] = float(np.mean(overall_scores))
+            results["summary"]["retrieval_success_rate"] = float(retrieval_successes / len(questions))
         
         return results
     
@@ -201,7 +176,6 @@ class RAGEvaluator:
         if not context_chunks:
             return "No context available."
         
-        # Find the chunk most similar to the question
         best_chunk = context_chunks[0]
         best_score = 0
         
@@ -211,7 +185,6 @@ class RAGEvaluator:
                 best_score = score
                 best_chunk = chunk
         
-        # Extract a sentence from the chunk
         sentences = best_chunk.split('.')
         if sentences:
             return sentences[0].strip() + "."
@@ -254,14 +227,12 @@ def main():
         evaluator = RAGEvaluator()
         results = evaluator.run_evaluation()
         
-        # Save results
         output_file = "data/eval_results.json"
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
         with open(output_file, 'w') as f:
             json.dump(results, f, indent=2)
         logger.info(f"Results saved to {output_file}")
         
-        # Print results
         print_results(results)
     
     except Exception as e:

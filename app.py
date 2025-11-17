@@ -3,28 +3,26 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import logging
-import json
 import os
-import requests
 from typing import List, Optional
 from sentence_transformers import SentenceTransformer
-from pymilvus import connections, Collection
+from pymilvus import MilvusClient
+from openai import OpenAI
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-EMBEDDING_MODEL = "Snowflake/snowflake-arctic-embed-s"
-MILVUS_HOST = "127.0.0.1"
-MILVUS_PORT = 19530
-COLLECTION_NAME = "pdf_chunks"
-LLM_BASE_URL = "http://localhost:11434"
-LLM_MODEL = "llama2:7b"
-TOP_K = 5
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "Snowflake/snowflake-arctic-embed-s")
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "pdf_chunks")
+DB_FILE = os.getenv("DB_FILE", "milvus_lite.db")
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:8001/v1")
+LLM_MODEL = os.getenv("LLM_MODEL", "meta-llama/Llama-2-7b-hf")
+TOP_K = int(os.getenv("TOP_K", "5"))
 
 app = FastAPI(title="Veridia RAG API", description="RAG system for Dr. Voss's Veridia research")
 
 embedding_model = None
-collection = None
+client = None
 
 class QueryRequest(BaseModel):
     question: str
@@ -35,22 +33,16 @@ class QueryResponse(BaseModel):
     source_chunks: Optional[List[str]] = None
 
 def initialize_models():
-    """Initialize embedding model and Milvus connection."""
-    global embedding_model, collection
+    """Initialize embedding model and Milvus Lite client."""
+    global embedding_model, client
     
     logger.info("Initializing models and database connections...")
     
     embedding_model = SentenceTransformer(EMBEDDING_MODEL)
     logger.info(f"Loaded embedding model: {EMBEDDING_MODEL}")
     
-    try:
-        connections.connect("default", host=MILVUS_HOST, port=MILVUS_PORT)
-        collection = Collection(COLLECTION_NAME)
-        collection.load()
-        logger.info(f"Connected to Milvus collection: {COLLECTION_NAME}")
-    except Exception as e:
-        logger.error(f"Error connecting to Milvus: {e}")
-        raise
+    client = MilvusClient(DB_FILE)
+    logger.info(f"Initialized MilvusClient with db file: {DB_FILE}")
 
 @app.on_event("startup")
 async def startup_event():
@@ -58,20 +50,14 @@ async def startup_event():
     initialize_models()
 
 def retrieve_context(question: str, top_k: int = TOP_K) -> tuple[List[str], List[float]]:
-    """Retrieve relevant chunks from Milvus."""
+    """Retrieve relevant chunks from Milvus Lite."""
     logger.info(f"Retrieving context for question: {question}")
     
     question_embedding = embedding_model.encode([question])[0]
     
-    search_params = {
-        "metric_type": "L2",
-        "params": {"nprobe": 16}
-    }
-    
-    results = collection.search(
+    results = client.search(
+        collection_name=COLLECTION_NAME,
         data=[question_embedding.tolist()],
-        anns_field="embedding",
-        param=search_params,
         limit=top_k,
         output_fields=["text"]
     )
@@ -79,10 +65,10 @@ def retrieve_context(question: str, top_k: int = TOP_K) -> tuple[List[str], List
     chunks = []
     distances = []
     
-    for hits in results:
-        for hit in hits:
-            chunks.append(hit.entity.get("text"))
-            distances.append(hit.distance)
+    if results and len(results) > 0:
+        for hit in results[0]:
+            chunks.append(hit["entity"]["text"])
+            distances.append(hit["distance"])
     
     logger.info(f"Retrieved {len(chunks)} relevant chunks")
     return chunks, distances
@@ -103,29 +89,18 @@ Question: {question}
 Answer:"""
     
     try:
-        response = requests.post(
-            f"{LLM_BASE_URL}/api/generate",
-            json={
-                "model": LLM_MODEL,
-                "prompt": prompt,
-                "stream": False,
-                "temperature": 0.7,
-            },
+        client = OpenAI(api_key="not-needed", base_url=LLM_BASE_URL)
+        response = client.completions.create(
+            model=LLM_MODEL,
+            prompt=prompt,
+            temperature=0.7,
+            max_tokens=512,
             timeout=60
         )
-        
-        if response.status_code == 200:
-            result = response.json()
-            answer = result.get("response", "").strip()
-            logger.info("Answer generated successfully")
-            return answer
-        else:
-            logger.error(f"LLM API error: {response.status_code}")
-            return "Unable to generate answer at this time."
+        answer = response.choices[0].text.strip()
+        logger.info("Answer generated successfully")
+        return answer
     
-    except requests.exceptions.ConnectionError:
-        logger.error(f"Cannot connect to LLM at {LLM_BASE_URL}")
-        return "LLM service is not available. Make sure Ollama is running."
     except Exception as e:
         logger.error(f"Error calling LLM: {e}")
         return f"Error generating answer: {str(e)}"

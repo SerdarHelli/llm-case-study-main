@@ -1,56 +1,93 @@
 version: '3.8'
 
 services:
-  # FastAPI application
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: veridia-vllm
+    ports:
+      - "8001:8000"
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
+    volumes:
+      - huggingface-cache:/root/.cache/huggingface
+    command: >
+      --model meta-llama/Llama-2-7b-hf 
+      --dtype float16 
+      --max-model-len 4096
+      --trust-remote-code
+      --gpu-memory-utilization 0.7
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 300s
+    networks:
+      - veridia-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
   api:
     build: .
     container_name: veridia-rag-api
     ports:
       - "8000:8000"
-    environment:
-      - MILVUS_HOST=milvus
-      - MILVUS_PORT=19530
-      - LLM_BASE_URL=http://ollama:11434
-      - LLM_MODEL=llama2:7b
     depends_on:
-      - milvus
-      - ollama
+      - vllm
     volumes:
       - ./data:/app/data
-      - ./logs:/app/logs
-    networks:
-      - veridia-network
-
-  # Milvus vector database
-  milvus:
-    image: milvusdb/milvus:v0.3.10
-    container_name: veridia-milvus
+      - app-db:/app
     environment:
-      ETCD_USE_EMBED: 'true'
-    ports:
-      - "19530:19530"
-      - "9091:9091"
-    volumes:
-      - milvus_data:/var/lib/milvus
+      - PYTHONUNBUFFERED=1
+      - LLM_BASE_URL=http://vllm:8000/v1
     networks:
       - veridia-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 300s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
-  # Ollama LLM service
-  ollama:
-    image: ollama/ollama:latest
-    container_name: veridia-ollama
-    ports:
-      - "11434:11434"
+  eval:
+    build: .
+    container_name: veridia-eval
+    depends_on:
+      api:
+        condition: service_healthy
     volumes:
-      - ollama_data:/root/.ollama
+      - ./data:/app/data
+      - app-db:/app
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: python scripts/eval.py
+    profiles:
+      - eval
     networks:
       - veridia-network
-    environment:
-      - OLLAMA_HOST=0.0.0.0:11434
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
 volumes:
-  milvus_data:
-  ollama_data:
+  huggingface-cache:
+  app-db:
 
 networks:
   veridia-network:

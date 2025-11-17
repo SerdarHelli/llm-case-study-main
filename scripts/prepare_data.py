@@ -5,26 +5,27 @@ import json
 import pymupdf
 import numpy as np
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict
 from sentence_transformers import SentenceTransformer
-from pymilvus import connections, Collection, FieldSchema, CollectionSchema, DataType
+from pymilvus import MilvusClient
 import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-CHUNK_SIZE = 500
-CHUNK_OVERLAP = 100
-EMBEDDING_MODEL = "Snowflake/snowflake-arctic-embed-s"
-MILVUS_HOST = "127.0.0.1"
-MILVUS_PORT = 19530
-COLLECTION_NAME = "pdf_chunks"
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "500"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "100"))
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "Snowflake/snowflake-arctic-embed-s")
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "pdf_chunks")
+DB_FILE = os.getenv("DB_FILE", "milvus_lite.db")
 
 class PDFProcessor:
-    def __init__(self, embedding_model: str = EMBEDDING_MODEL):
+    def __init__(self, embedding_model: str = EMBEDDING_MODEL, db_file: str = DB_FILE):
         self.embedding_model = SentenceTransformer(embedding_model)
         self.embedding_dim = self.embedding_model.get_sentence_embedding_dimension()
+        self.client = MilvusClient(db_file)
         logger.info(f"Loaded embedding model with dimension: {self.embedding_dim}")
+        logger.info(f"Initialized MilvusClient with db file: {db_file}")
     
     def extract_text_from_pdf(self, pdf_path: str) -> str:
         """Extract text from PDF file."""
@@ -69,54 +70,39 @@ class PDFProcessor:
         embeddings = self.embedding_model.encode(texts, show_progress_bar=True)
         return embeddings
     
-    def setup_milvus(self) -> Collection:
-        """Setup Milvus collection."""
-        logger.info(f"Connecting to Milvus at {MILVUS_HOST}:{MILVUS_PORT}")
-        connections.connect("default", host=MILVUS_HOST, port=MILVUS_PORT)
+    def setup_collection(self) -> None:
+        """Setup Milvus Lite collection."""
+        logger.info(f"Setting up collection: {COLLECTION_NAME}")
         
-        # Drop existing collection if it exists
-        try:
-            Collection.drop(COLLECTION_NAME)
-            logger.info(f"Dropped existing collection {COLLECTION_NAME}")
-        except:
-            pass
+        if self.client.has_collection(COLLECTION_NAME):
+            logger.info(f"Dropping existing collection {COLLECTION_NAME}")
+            self.client.drop_collection(COLLECTION_NAME)
         
-        # Create new collection
-        fields = [
-            FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
-            FieldSchema(name="chunk_id", dtype=DataType.INT64),
-            FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=65535),
-            FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=self.embedding_dim),
-        ]
-        
-        schema = CollectionSchema(fields=fields, description="PDF chunks collection")
-        collection = Collection(name=COLLECTION_NAME, schema=schema)
-        
-        # Create index
-        index_params = {
-            "metric_type": "L2",
-            "index_type": "IVF_FLAT",
-            "params": {"nlist": 128}
-        }
-        collection.create_index(field_name="embedding", index_params=index_params)
-        
-        logger.info(f"Created Milvus collection: {COLLECTION_NAME}")
-        return collection
+        logger.info(f"Creating collection {COLLECTION_NAME}")
+        self.client.create_collection(
+            collection_name=COLLECTION_NAME,
+            dimension=self.embedding_dim,
+            metric_type="L2"
+        )
+        logger.info(f"Collection {COLLECTION_NAME} created successfully")
     
-    def store_chunks_in_milvus(self, collection: Collection, chunks: List[str], 
-                               embeddings: np.ndarray) -> None:
-        """Store chunks and embeddings in Milvus."""
-        logger.info(f"Storing {len(chunks)} chunks in Milvus")
+    def store_chunks_in_milvus(self, chunks: List[str], embeddings: np.ndarray) -> None:
+        """Store chunks and embeddings in Milvus Lite."""
+        logger.info(f"Storing {len(chunks)} chunks in Milvus Lite")
         
-        data = {
-            "chunk_id": list(range(len(chunks))),
-            "text": chunks,
-            "embedding": embeddings.tolist()
-        }
+        data = []
+        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+            data.append({
+                "id": i,
+                "vector": embedding.tolist(),
+                "text": chunk
+            })
         
-        collection.insert(data)
-        collection.flush()
-        logger.info("Chunks stored and flushed to Milvus")
+        res = self.client.insert(
+            collection_name=COLLECTION_NAME,
+            data=data
+        )
+        logger.info(f"Inserted {len(data)} documents. Response: {res}")
     
     def save_metadata(self, chunks: List[str], output_path: str = "data/metadata.json") -> None:
         """Save metadata about chunks."""
@@ -128,6 +114,7 @@ class PDFProcessor:
             "embedding_model": EMBEDDING_MODEL,
             "embedding_dim": self.embedding_dim,
             "collection_name": COLLECTION_NAME,
+            "db_file": DB_FILE,
         }
         
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -145,21 +132,16 @@ def main():
     
     processor = PDFProcessor()
     
-    # Extract text
     text = processor.extract_text_from_pdf(pdf_path)
     logger.info(f"Extracted {len(text)} characters")
     
-    # Chunk text
     chunks = processor.chunk_text(text)
     
-    # Generate embeddings
     embeddings = processor.generate_embeddings(chunks)
     
-    # Setup Milvus and store
-    collection = processor.setup_milvus()
-    processor.store_chunks_in_milvus(collection, chunks, embeddings)
+    processor.setup_collection()
+    processor.store_chunks_in_milvus(chunks, embeddings)
     
-    # Save metadata
     processor.save_metadata(chunks)
     
     logger.info("PDF processing complete!")
